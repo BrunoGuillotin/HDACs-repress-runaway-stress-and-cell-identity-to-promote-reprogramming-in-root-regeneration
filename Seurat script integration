@@ -1,1 +1,139 @@
-######
+############ Script integration Nuclei vs cells Arabidopsis 
+
+library(plyr)
+library(readr)
+library(gtools)
+library(dplyr)
+library(ggplot2)
+library(egg)
+library(stringr)
+library(Seurat)
+
+setwd(Path to files)
+list.filenames<-list.files()
+list.filenames
+orderedlist.filenames<- mixedsort(list.filenames)
+#organise the list in alphabetical order
+
+# create an empty list that will serve as a container to receive the incoming files
+list.data<-list()
+
+# name your replicates 4h, 9, 14, 24 and 36 h ctr and cut, sorry about the shifting names
+
+NamesProject <- c("Ctr4h","Cut4h","Ctr914","Ctr224","Cut9h","Cut14h","Cut24h","CTR36h","CUT36H")
+
+listGraph <- list()
+# create a loop to read in your data
+for (i in 1:length(NamesProject)) {
+  list.data[[i]]<- Read10X(orderedlist.filenames[i], strip.suffix = T, gene.column = 1)
+  list.data[[i]] <- CreateSeuratObject(list.data[[i]], min.cells = 3, min.features = 200, project = NamesProject[i])
+  listGraph[[i]] <- FeatureScatter(list.data[[i]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+  list.data[[i]][["percent.mt"]] <- PercentageFeatureSet(list.data[[i]], pattern = "^ATM")
+  
+}
+
+graphlistRNA <- list()
+graphlistGene <- list()
+graphlistGenevsRNA <- list()
+NamesList <- NamesProject
+
+for (i in 1:length(list.data)) {
+  graphlistRNA[[i]] <- ggplot(list.data[[i]]@meta.data, aes(x=nCount_RNA)) + 
+    geom_density()+ scale_x_continuous(trans='log10',breaks=c(0,100,500,1000,5000,10000,50000,100000))  + 
+    labs(title=paste0(NamesList[i]), x= NULL, y = "nCount_RNA")+ theme_linedraw()+ 
+    geom_vline(xintercept = 4000, color = "red", size=1.5)+ theme(axis.text.x = element_text(angle=45,hjust=1))
+  graphlistGene[[i]] <- ggplot(list.data[[i]]@meta.data, aes(x=nFeature_RNA)) + 
+    geom_density()+ scale_x_continuous(trans='log10') + 
+    labs(title=paste0(NamesList[i]), x= NULL, y = "nFeature_RNA")+ 
+    theme_linedraw()+ geom_vline(xintercept = 2000,color = "red", size=1.5)+ theme(axis.text.x = element_text(angle=45,hjust=1))
+  
+  graphlistGenevsRNA[[i]] <- FeatureScatter(list.data[[i]], feature1 = "nCount_RNA", feature2 = "nFeature_RNA") + scale_x_continuous(labels = function(x) format(x, scientific = TRUE)) + 
+    scale_y_continuous( limits = c(0,13000)) + scale_x_continuous(limits = c(0,200000))
+}
+
+
+graph <- ggarrange(plots =graphlistGenevsRNA , ncol = 5, nrow = 2)
+ggsave("nFeatureRNAvsCountRNA_raw.pdf",graph, device = "pdf",width = 8.27,
+       height = 6,
+       units = c("in"),
+       dpi = 300)
+
+graph <- ggarrange(plots=graphlistRNA,  ncol = 5, nrow = 2)
+
+ggsave("nCountRNA_raw.pdf",graph, device = "pdf",width = 8.27,
+       height = 6,
+       units = c("in"),
+       dpi = 300)
+graph <-ggarrange(plots=graphlistGene,  ncol = 5, nrow = 2)
+ggsave("nFeatureRNA_raw.pdf",graph, device = "pdf",width = 8.27,
+       height = 6,
+       units = c("in"),
+       dpi = 300)
+
+
+names(list.data) <- NamesProject
+
+list.dataPurif <- list()
+for (i in 1:length(list.data)) {
+  list.dataPurif[[i]] <- subset(list.data[[i]], subset = nCount_RNA > 10000 & nFeature_RNA > 1650 & nCount_RNA < 150000 & nFeature_RNA < 10000 & percent.mt < 5)
+}
+
+
+# Cell names was not changed before integration which was a mistakes. As a results ctr4h cells are renamed by seurat with the barcode _1
+# cut4h barecode is renamed with _2 and so on. This is a problem for the integration because seurat will not be able to find the same cell in the two datasets. So I need to rename the cells in each dataset with the same name as the project name and the barcode without the suffix _1, _2, _3, _4, _5, _6, _7, _8 and _9.
+# this aws not done in the puublished dataset I think 
+listnames <- list()
+
+for (i in 1:length(list.dataPurif)) {
+  listnames[[i]] <- WhichCells(list.dataPurif[[i]])
+  listnames[[i]] <- str_remove(listnames[[i]], "-1")
+  listnames[[i]] <- paste(NamesProject[i],listnames[[i]], sep = "_")
+  list.dataPurif[[i]] <- RenameCells(list.dataPurif[[i]], new.names = listnames[[i]])
+}
+
+
+names(list.dataPurif) <- NamesProject
+save(list.dataPurif, file = "Seurat object not integrated expression matrices root regeneration.RData")
+
+# integrate using the SCT transform method.
+
+ctrcut.listSCT <- list.dataPurif
+
+for (i in 1:length(list.dataPurif)) {
+  ctrcut.listSCT[[i]] <- SCTransform(ctrcut.listSCT[[i]], verbose = TRUE)
+  
+}
+
+
+#to avoid the usual error of the size limit suing the PrepSCTIntegration
+options(future.globals.maxSize = 13000 * 1024^2)
+
+#
+ctrcut.features <- SelectIntegrationFeatures(object.list = ctrcut.listSCT, nfeatures = 3000)
+ctrcut.list <- PrepSCTIntegration(object.list = ctrcut.listSCT, anchor.features = ctrcut.features)
+
+# We set up the reference ctr cells to map the cut ones in order they are c("Ctr4h","Cut4h","Ctr914","Ctr224","Cut9h","Cut14h","Cut24h","CTR36h","CUT36H")
+reference_datasetSCT <- c(1,3,4,8) 
+
+pbmc.anchorsSCT <- FindIntegrationAnchors(object.list = ctrcut.list, normalization.method = "SCT", 
+                                          anchor.features = ctrcut.features, reference = reference_datasetSCT)
+pbmc.integratedSCT <- IntegrateData(anchorset = pbmc.anchorsSCT, normalization.method = "SCT", dims = 1:100)
+
+pbmc.integratedSCTREF <- RunPCA(pbmc.integratedSCT, npcs = 100, verbose = FALSE)
+
+pbmc.integratedSCTREF <- RunTSNE(object = pbmc.integratedSCTREF, dims = 1:30)
+
+pbmc.integratedSCTREF = FindNeighbors(object = pbmc.integratedSCTREF,  dims = 1:30, reduction = "pca", assay = "integrated", verbose = T, force.recalc = T)
+#below the resolution depends on how many cluster you want to add, the higher the resolution is the more cluster you find
+# the "correct amount of cluster" can be define by the biology and how many cell type do we expect.
+pbmc.integrated_SCTREF2 = FindClusters(object = pbmc.integratedSCTREF, resolution = 0.8, verbose = T)
+pbmc.integrated_SCTREF2 <- RunUMAP(pbmc.integratedSCTREF2, dims = 1:100)
+
+graph <- DimPlot(pbmc.integrated_SCTREF2, label = T)
+
+pdf("Umap_pbmc.integrated_SCTREF_integration_Res08_Clusters.pdf", width = 9, height = 8)
+print(graph)
+dev.off()
+
+
+save(pbmc.in
